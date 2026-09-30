@@ -1,0 +1,16 @@
+package com.github.guoyyit.portfolioattributionjava.web;
+
+/** 稳定、可区分的拒绝原因编码。 */
+public enum ErrorCode {
+    NEGATIVE_ASSET,
+    NEGATIVE_HOLDING,
+    MISSING_ENDPOINT_VALUATION,
+    MISSING_INTERMEDIATE_VALUATION,
+    SEGMENT_SUM_MISMATCH,
+    CASH_FLOW_OUTSIDE_RANGE,
+    ZERO_CASH_FLOW,
+    UNKNOWN_SEGMENT,
+    INVALID_DATE_RANGE,
+    MONEY_WEIGHTED_NO_SOLUTION,
+    INVALID_REQUEST
+}
