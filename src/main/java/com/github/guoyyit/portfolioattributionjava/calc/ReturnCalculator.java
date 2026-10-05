@@ -7,7 +7,9 @@ import org.springframework.stereotype.Component;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 收益计算。
@@ -25,12 +27,15 @@ import java.util.Map;
 @Component
 public class ReturnCalculator {
 
+    private static final double NET_FLOW_TOLERANCE = 1e-12;
+
     public double timeWeightedReturn(SectorSeries series) {
         LocalDate[] dates = series.dates();
         double[] totals = series.totals();
         if (dates.length < 2) {
             return 0d;
         }
+        requireValuationOnFlowDates(series);
         Map<LocalDate, Double> flowByDate = netFlowsByDate(series);
         double compounded = 1d;
         for (int i = 1; i < dates.length; i++) {
@@ -57,6 +62,7 @@ public class ReturnCalculator {
         if (dates.length < 2) {
             return 0d;
         }
+        requireValuationOnFlowDates(series);
         LocalDate start = dates[0];
         LocalDate end = dates[dates.length - 1];
         long totalDays = ChronoUnit.DAYS.between(start, end);
@@ -87,6 +93,45 @@ public class ReturnCalculator {
             flowByDate.merge(flow.date(), flow.amount(), Double::sum);
         }
         return flowByDate;
+    }
+
+    /**
+     * 区间内部现金流（严格位于 (d0, dn] 的日期）必须落在估值日期轴上。
+     *
+     * <p>TWR 需要在现金流当日切分子区间并取得“扣除现金流后的期末市值”；
+     * 若当日没有估值快照，TWR 无法对该现金流定义子区间收益，而 MWR 仍会把它
+     * 计入分子与加权分母——两种口径将给出互相矛盾的处理。遇到这种数据组合时，
+     * 以 {@link ErrorCode#CASH_FLOW_WITHOUT_VALUATION} 稳定拒绝，拒绝原因只
+     * 取决于输入数据，与请求顺序无关。
+     *
+     * <p>同一日期多笔现金流按净额归并；净额为 0（容差 1e-12）的日期对两种口径
+     * 都没有影响，允许缺少快照。
+     */
+    public void requireValuationOnFlowDates(SectorSeries series) {
+        LocalDate[] dates = series.dates();
+        if (dates.length == 0) {
+            return;
+        }
+        LocalDate start = dates[0];
+        LocalDate end = dates[dates.length - 1];
+        Set<LocalDate> grid = new HashSet<>();
+        for (LocalDate date : dates) {
+            grid.add(date);
+        }
+        Map<LocalDate, Double> netByDate = netFlowsByDate(series);
+        for (Map.Entry<LocalDate, Double> entry : netByDate.entrySet()) {
+            LocalDate date = entry.getKey();
+            boolean insideWindow = date.isAfter(start) && !date.isAfter(end);
+            if (insideWindow && !grid.contains(date)
+                    && Math.abs(entry.getValue()) > NET_FLOW_TOLERANCE) {
+                throw new RejectionException(ErrorCode.CASH_FLOW_WITHOUT_VALUATION,
+                        "external cash flow dated " + date
+                                + " has no valuation snapshot on that date; TWR cannot be "
+                                + "defined while MWR would include the flow, so the request "
+                                + "is rejected. Submit a valuation for " + date
+                                + " or correct/remove the cash flow");
+            }
+        }
     }
 
     /**

@@ -156,6 +156,20 @@ class PortfolioServiceIntegrationTest {
         assertEquals(ErrorCode.ZERO_CASH_FLOW, zeroException.getErrorCode());
     }
 
+    @Test
+    void adhocCalculationRejectsInteriorCashFlowWithoutMatchingValuation() {
+        List<CalculateReturnRequest.ValuationPointDto> valuations = List.of(
+                new CalculateReturnRequest.ValuationPointDto(D0, 100d),
+                new CalculateReturnRequest.ValuationPointDto(D2, 110d));
+
+        // D1 位于 (D0, D2] 但没有估值点：TWR 无法定义，两种口径必须一致拒绝
+        CalculateReturnRequest orphanFlow = new CalculateReturnRequest(
+                valuations, List.of(new CalculateReturnRequest.CashFlowPointDto(D1, 5d)));
+        RejectionException ex = assertThrows(RejectionException.class,
+                () -> service.calculateReturn(orphanFlow));
+        assertEquals(ErrorCode.CASH_FLOW_WITHOUT_VALUATION, ex.getErrorCode());
+    }
+
     private void recordBenchmark() {
         service.recordValuation(new ValuationRequest("B6", D0, 100d, List.of(
                 new ValuationRequest.SectorValueDto("A", 50d),

@@ -37,6 +37,10 @@ R_TWR = ∏ (1 + r_i) - 1
 因此任意区间的 TWR 都可由其相邻子区间结果复合得到，与直接对该区间一次性
 计算的结果严格一致（浮点误差除外）。当某子区间期初市值为 0 时，
 要求期末（扣除现金流后）也为 0，此时该子区间收益记为 0；否则拒绝计算。
+自动化测试对多点区间（包括 3 个估值点以上、任意相邻切分、以及现金流修正
+前后）断言 `R(d0,dn) = ∏(1 + R(d_i, d_(i+1))) - 1`，
+见 `ReturnCalculatorTest.wholeIntervalMatchesCompoundingAcrossThreePointsAndArbitrarySplit`
+与 `BoundaryConsistencyIntegrationTest.twrCompoundFromSubRangesEqualsDirectQueryAfterCorrection`。
 
 ### 资金加权收益（MWR，Modified Dietz）
 
@@ -50,6 +54,27 @@ w_i = (d_n - d_i) / (d_n - d_0)
 
 两种口径相互独立：TWR 剔除现金流时点与规模的影响，MWR 反映现金流时点的影响，
 同一区间两者各自按定义独立成立，不要求相等。
+
+### 现金流时点边界（无估值快照日期上的现金流）
+
+TWR 必须在每笔现金流当日切分子区间，并取得“当日扣除现金流后的期末市值”；
+若某笔区间内部现金流（日期严格位于 `(d0, dn]`）落在**没有估值快照的日期**，
+TWR 在现有数据下无法对该子区间给出定义，而 MWR 仍会把该现金流计入分子与
+加权分母——这将造成同一区间内一种口径计入现金流、另一种口径将其静默忽略的
+矛盾。为保证两种口径不会互相矛盾，服务此时**拒绝**整个查询：
+
+- 错误码 `CASH_FLOW_WITHOUT_VALUATION`，HTTP 400；
+- 拒绝只取决于输入数据（哪些日期有快照、哪些日期有非零净额现金流），
+  与请求顺序、录入顺序无关；同一数据重复请求得到完全相同的错误码与信息；
+- 同一日期多笔现金流先按净额归并：净额为 0（容差 `1e-12`）时对两种口径
+  均无经济影响，允许该日期没有快照；
+- 起始日 `d0` 的现金流视为已含在 `V0` 中（两种口径都不另计）；区间
+  `(d0, dn]` 之外的现金流不参与该区间，故这两类现金流永远不会触发该拒绝；
+- 消除拒绝的方式只有两种：补录该日期的估值快照，或修正/删除该现金流。
+
+该规则对持久化查询（`GET /api/returns`）与显式一次性计算
+（`POST /api/calculate-returns`）同等适用；归因查询中的组合侧现金流
+也受同一规则约束。
 
 ## 归因分解（BHB）
 
@@ -85,6 +110,22 @@ k = (R_P - R_B) / Σ_i (rP_i - rB_i)
 
 该恒等在输出舍入**之前**严格成立。
 
+### 缺少行业拆分时的归因行为
+
+行业拆分按“侧 + 日期”区分（行业市值 0 是合法录入，存在性不以市值是否为 0
+判断）。规则如下：
+
+| 组合侧 | 基准侧 | 行为 |
+| --- | --- | --- |
+| 全程无行业拆分 | 全程无行业拆分 | 正常返回：整体作为单一聚合组，配置效应 = 交互效应 = 0，选择效应 = 超额收益，三项恒等依旧严格成立；响应中 `sectors` 为空列表 |
+| 有行业拆分 | 无行业拆分 | 拒绝：`SECTOR_BREAKDOWN_MISSING` |
+| 无行业拆分 | 有行业拆分 | 拒绝：`SECTOR_BREAKDOWN_MISSING` |
+| 行业集合只在部分日期出现（任意一侧、任意日期缺行） | — | 拒绝：`SECTOR_BREAKDOWN_MISSING`，错误信息指明缺失的行业与日期 |
+
+即：要么两侧都在全部估值日期上提供同一组行业拆分，要么两侧都完全不提供；
+单侧 / 部分缺失在 BHB 下没有明确定义，因此以稳定、可区分的错误码拒绝，
+而不是静默按 0 填充后给出失真的分解。拒绝原因只取决于数据本身。
+
 ## 舍入规则
 
 - 所有内部计算使用 `double` 全精度，不在中间步骤舍入。
@@ -101,15 +142,39 @@ k = (R_P - R_B) / Σ_i (rP_i - rB_i)
 - 不缓存任何计算结果，每次查询都从持久层重新派生，因此历史数据修正后，
   受影响区间立即得到新结果，未受影响区间保持不变。
 - 区间两个端点都必须存在估值快照，否则以 `MISSING_ENDPOINT_VALUATION` 拒绝。
+- 区间内部现金流日期必须存在估值快照，否则以 `CASH_FLOW_WITHOUT_VALUATION`
+  拒绝（见“现金流时点边界”）。
 
 ## 并发与重启恢复
 
-- 所有写操作经同一把进程内写锁串行化，并在单个数据库事务中提交；
-  “快照总市值 + 行业拆分”要么整体生效要么整体不生效。
-- 查询在单个只读事务中读取数据库一致快照，任何时刻都不会读到部分写入
-  或新旧混合的状态。
-- 数据持久化到文件型 H2（默认 `./data/portfolio`）。进程在任意时刻终止后重启，
-  已提交的录入依然存在，未提交事务由数据库回滚，不会留下部分生效的记录。
+一致性由**两层机制**共同保证，任何一次查询都只能观察到某个完整提交点：
+
+1. **进程内读写锁（`WriteGuard`）**：写操作获取排他锁，且持锁范围覆盖
+   *整个数据库事务*——在事务开启前加锁、事务提交/回滚之后才释放；读查询
+   获取共享锁并在整个只读事务期间持有。因此查询绝不会与写事务并发执行，
+   不可能读到提交中途“新总市值 + 旧行业拆分”之类的跨表混合状态。
+2. **查询事务快照隔离**：读查询在单条只读事务中完成其全部 SELECT，
+   隔离级别由配置项 **`portfolio.query.isolation`** 控制：
+   - `SNAPSHOT`（**默认**，H2 的 JDBC 隔离级别 6）：事务内多条读取始终
+     看到事务开始时的同一数据库快照，即使期间有其他事务提交；
+   - `READ_COMMITTED` / `SERIALIZABLE`：可显式切换（换用其他数据库时
+     可设为该库支持的对应级别）。
+   该配置项见 `application.properties`。
+
+“快照总市值 + 行业拆分”在单个数据库事务内替换，要么整体生效要么整体不
+生效。可验证性（而不只是文档声明）：
+
+- `ConcurrencyIntegrationTest`：大量写线程与并发返回查询交织，断言每次
+  查询都返回有限且合理的结果；
+- `CrossTableConcurrencyIntegrationTest`：写线程持续跨表修正端点快照，
+  读线程并发做归因查询并断言**行业期初权重之和恒为 1**、三项合计恒等于
+  超额收益、行业级效应之和与组合级一致。该测试在去掉读锁/隔离（注入读
+  事务内语句间延迟）时稳定失败，在当前实现下稳定通过。
+
+数据持久化到文件型 H2（默认 `./data/portfolio`）。进程在任意时刻终止后重启，
+已提交的录入依然存在，未提交事务由数据库回滚，不会留下部分生效的记录
+（`RecoveryIntegrationTest` 覆盖重启恢复与重启后的修正）。历史数据无需
+迁移：表结构未发生破坏性变化，旧库可直接被新版本查询。
 
 ## HTTP 接口
 
@@ -164,6 +229,34 @@ k = (R_P - R_B) / Σ_i (rP_i - rB_i)
 | `SECTOR_TOTAL_MISMATCH` | 行业市值之和与总市值不一致 |
 | `SECTOR_CASH_FLOW_MISSING` | 现金流未指定行业 |
 | `SECTOR_SET_MISMATCH` | 组合与基准的行业集合不一致 |
+| `CASH_FLOW_WITHOUT_VALUATION` | 区间内部现金流落在没有估值快照的日期（两种口径无法一致定义） |
+| `SECTOR_BREAKDOWN_MISSING` | 仅一侧提供行业拆分，或某行业在部分估值日期缺拆分记录 |
+
+## 可复现的验证方法
+
+```bash
+mvn test                 # 全部 36 个单元/集成测试（含并发与端到端 HTTP）
+mvn spring-boot:run      # 或：mvn package 后 java -jar target/*.jar
+```
+
+端到端 HTTP 复核（`EndToEndHttpIntegrationTest` 已自动化同样流程）：
+
+```bash
+# 1) 启动（可改端口与数据源，避免触碰已有历史库）
+java -jar target/portfolio-attribution-java-1.0-SNAPSHOT.jar --server.port=8088 \
+  --spring.datasource.url='jdbc:h2:file:/tmp/pam-e2e/manual;AUTO_SERVER=FALSE'
+
+# 2) 录入三日快照（含行业拆分）与 D1 现金流
+curl -s -X POST localhost:8088/api/valuations -H 'Content-Type: application/json' \
+  -d '{"portfolioId":"P","date":"2024-03-01","totalValue":100,"sectors":[{"sectorId":"A","marketValue":60},{"sectorId":"B","marketValue":40}]}'
+# ... 其余录入见 EndToEndHttpIntegrationTest / 本次复核记录
+
+# 3) 现金流落在无快照日期 → 400 + CASH_FLOW_WITHOUT_VALUATION
+curl "localhost:8088/api/returns?portfolioId=P&start=2024-03-01&end=2024-03-15"
+
+# 4) 归因恒等：allocation + selection + interaction == excessReturn（|偏差| <= 2e-6）
+curl "localhost:8088/api/attribution?portfolioId=P&benchmarkId=B&start=2024-03-01&end=2024-03-15"
+```
 
 ## 构建与测试
 
@@ -173,5 +266,9 @@ mvn spring-boot:run
 ```
 
 测试覆盖：乱序录入、重复提交幂等、事后修正的影响范围、多期 TWR 复合与
-直接计算一致、TWR/MWR 定义、归因三项合计等于超额收益、显式输入的稳定拒绝、
-并发读写一致性以及基于文件数据库的重启恢复。
+直接计算一致、TWR/MWR 定义、**现金流落在无快照日期时两种口径一致拒绝
+（含净额为 0、起止/区间外边界、乱序稳定性）**、归因三项合计等于超额收益、
+**两侧均无行业拆分的聚合归因、单侧/部分缺失行业信息的稳定拒绝**、
+显式输入的稳定拒绝、**跨表并发读写只观察完整提交点**、并发读写一致性、
+基于文件数据库的重启恢复与**历史数据免迁移**，以及实际启动 Web 容器后
+经对外 HTTP 接口完成的端到端录入—修正—收益—归因复核。

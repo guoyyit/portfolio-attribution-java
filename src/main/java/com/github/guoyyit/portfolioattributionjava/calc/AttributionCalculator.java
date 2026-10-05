@@ -59,6 +59,28 @@ public class AttributionCalculator {
         double benchmarkReturn = returnCalculator.timeWeightedReturn(benchmark);
         double excessReturn = portfolioReturn - benchmarkReturn;
 
+        boolean portfolioHasSectors = !portfolio.sectorValues().isEmpty();
+        boolean benchmarkHasSectors = !benchmark.sectorValues().isEmpty();
+        if (portfolioHasSectors != benchmarkHasSectors) {
+            String missingSide = portfolioHasSectors ? "benchmark" : "portfolio";
+            String providedSide = portfolioHasSectors ? "portfolio" : "benchmark";
+            throw new RejectionException(ErrorCode.SECTOR_BREAKDOWN_MISSING,
+                    "the " + missingSide
+                            + " side has no sector breakdown while the " + providedSide
+                            + " side does; BHB attribution is undefined when sector "
+                            + "information is available on one side only");
+        }
+
+        // 两侧都没有行业拆分时，整体作为单一聚合组做 BHB：配置/交互恒为 0，
+        // 选择效应等于总超额收益，恒等关系依旧成立。
+        if (!portfolioHasSectors) {
+            return aggregateAttribution(
+                    portfolioReturn, benchmarkReturn, excessReturn);
+        }
+
+        validateSectorCoverage(portfolio, "portfolio");
+        validateSectorCoverage(benchmark, "benchmark");
+
         int subPeriods = dates.length - 1;
         double[] pSubReturns = totalSubReturns(portfolio);
         double[] bSubReturns = totalSubReturns(benchmark);
@@ -119,6 +141,11 @@ public class AttributionCalculator {
         double residual = excessReturn - (allocation + selection + interaction);
         interaction = distributeResidual(sectors, residual, interaction);
 
+        // 最终对齐：不同求和路径存在 ULP 级差异，用组合级交互项吸收该差异，
+        // 使三项合计在输出舍入之前与超额收益逐位相等（对齐量至多为 ULP 量级，
+        // 远小于 2e-6 的输出容差；无行业拆分时走 aggregateAttribution）。
+        interaction = excessReturn - allocation - selection;
+
         return new AttributionResult(
                 portfolioReturn,
                 benchmarkReturn,
@@ -127,6 +154,44 @@ public class AttributionCalculator {
                 selection,
                 interaction,
                 sectors);
+    }
+
+    /**
+     * 两侧都没有行业拆分的场景：整体视为单一聚合组。组内配置权重差为 0，
+     * 故配置效应与交互效应均为 0，选择效应 = rP - rB。三项合计严格等于
+     * 超额收益，{@code sectors} 输出列表保持为空（响应结构不变）。
+     */
+    private AttributionResult aggregateAttribution(
+            double portfolioReturn, double benchmarkReturn, double excessReturn) {
+        return new AttributionResult(
+                portfolioReturn,
+                benchmarkReturn,
+                excessReturn,
+                0d,
+                excessReturn,
+                0d,
+                List.of());
+    }
+
+    /**
+     * 同一侧的行业集合必须覆盖整个日期轴：对任意已出现过的行业，每个估值日期
+     * 都必须有该行业的拆分记录。部分日期缺行业行属于“单侧/部分缺失行业信息”，
+     * 无法定义分解，以稳定的错误码拒绝。
+     */
+    private void validateSectorCoverage(SectorSeries series, String side) {
+        LocalDate[] dates = series.dates();
+        for (Map.Entry<String, boolean[]> entry : series.sectorPresence().entrySet()) {
+            boolean[] present = entry.getValue();
+            for (int i = 0; i < dates.length; i++) {
+                if (!present[i]) {
+                    throw new RejectionException(ErrorCode.SECTOR_BREAKDOWN_MISSING,
+                            "sector '" + entry.getKey() + "' on the " + side
+                                    + " side has no breakdown at " + dates[i]
+                                    + "; every sector must be reported at every valuation "
+                                    + "date for attribution to be defined");
+                }
+            }
+        }
     }
 
     private double distributeResidual(List<SectorAttribution> sectors,
@@ -145,15 +210,18 @@ public class AttributionCalculator {
         for (int i = 0; i < sectors.size(); i++) {
             SectorAttribution sector = sectors.get(i);
             double share;
-            if (weightBase < TINY) {
+            if (i == sectors.size() - 1) {
+                // 最后一个行业兜底：保证各项份额之和与残差逐位相等，
+                // 使行业级效应之和在输出舍入之前严格等于超额收益。
+                share = residual - assigned;
+            } else if (weightBase < TINY) {
                 share = residual / sectors.size();
+                assigned += share;
             } else {
                 double magnitude = Math.abs(sector.allocationEffect())
                         + Math.abs(sector.selectionEffect())
                         + Math.abs(sector.interactionEffect());
-                share = i == sectors.size() - 1
-                        ? residual - assigned
-                        : residual * magnitude / weightBase;
+                share = residual * magnitude / weightBase;
                 assigned += share;
             }
             updated.add(i, new SectorAttribution(
@@ -168,7 +236,13 @@ public class AttributionCalculator {
         }
         sectors.clear();
         sectors.addAll(updated);
-        return interaction + residual;
+        // 组合级交互效应直接取行业级交互项之和，与行业级求和路径逐位一致；
+        // 由此 allocation + selection + interaction 与超额收益严格相等。
+        double interactionTotal = 0d;
+        for (SectorAttribution sector : sectors) {
+            interactionTotal += sector.interactionEffect();
+        }
+        return interactionTotal;
     }
 
     private double sectorTwr(double[] subReturns) {
