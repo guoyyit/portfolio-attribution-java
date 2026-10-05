@@ -97,4 +97,46 @@ class ReturnCalculatorTest {
         // net flow 5: r1 = 0, r2 = 107.1/105 - 1 = 0.02
         assertEquals(0.02, calculator.timeWeightedReturn(series), EPS);
     }
+
+    @Test
+    void cashFlowOnDateWithoutSnapshotIsCountedByBothMeasures() {
+        LocalDate d0 = LocalDate.of(2024, 1, 1);
+        LocalDate d1 = LocalDate.of(2024, 1, 8); // no valuation snapshot here
+        LocalDate d2 = LocalDate.of(2024, 1, 15);
+        List<CashFlowPoint> flows = List.of(new CashFlowPoint(d1, 5, "CASH"));
+        SectorSeries series = new SectorSeries(
+                new LocalDate[]{d0, d2}, new double[]{100, 110},
+                Map.of(), flows);
+
+        // TWR: flow joins the containing sub-interval (d0, d2]
+        assertEquals((110 - 100 - 5) / 100d,
+                calculator.timeWeightedReturn(series), EPS);
+        // MWR: flow weighted by its actual date, weight = 7/14
+        assertEquals(5d / (100d + 5d * 7d / 14d),
+                calculator.moneyWeightedReturn(series), EPS);
+    }
+
+    @Test
+    void twrCompoundsAcrossSubIntervalsWithMidIntervalCashFlow() {
+        LocalDate d0 = LocalDate.of(2024, 1, 1);
+        LocalDate d1 = LocalDate.of(2024, 1, 8);
+        LocalDate dMid = LocalDate.of(2024, 1, 10); // no valuation snapshot here
+        LocalDate d2 = LocalDate.of(2024, 1, 15);
+        List<CashFlowPoint> flows = List.of(new CashFlowPoint(dMid, 6, "CASH"));
+        SectorSeries full = new SectorSeries(
+                new LocalDate[]{d0, d1, d2}, new double[]{100, 108, 120},
+                Map.of(), flows);
+
+        double whole = calculator.timeWeightedReturn(full);
+        double first = calculator.timeWeightedReturn(new SectorSeries(
+                new LocalDate[]{d0, d1}, new double[]{100, 108},
+                Map.of(), flows));
+        double second = calculator.timeWeightedReturn(new SectorSeries(
+                new LocalDate[]{d1, d2}, new double[]{108, 120},
+                Map.of(), flows));
+
+        // r1 = 0.08; r2 = (120-108-6)/108; flow belongs to (d1, d2] in both views
+        assertEquals(whole, (1 + first) * (1 + second) - 1, EPS);
+        assertEquals(1.08 * (1 + 6d / 108d) - 1, whole, EPS);
+    }
 }

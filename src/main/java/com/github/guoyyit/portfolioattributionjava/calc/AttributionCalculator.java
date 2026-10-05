@@ -14,18 +14,24 @@ import java.util.TreeMap;
 /**
  * Brinson-Hood-Beebower（BHB）归因。
  *
- * <p>在每个外部现金流切出的子区间 i 上做标准分解：
+ * <p>在每个估值子区间 i 上做标准分解：
  * <ul>
  *   <li>配置 A_s,i = (wP_s,i - wB_s,i)(rB_s,i - rB_i)</li>
  *   <li>选择 S_s,i = wB_s,i (rP_s,i - rB_s,i)</li>
  *   <li>交互 I_s,i = (wP_s,i - wB_s,i)(rP_s,i - rB_s,i)</li>
  * </ul>
- * 每个子区间内 Σ_s(A+S+I) = rP_i - rB_i 严格成立。
+ * 每个子区间内 Σ_s(A+S+I) = rP_i - rB_i 严格成立。发生在没有估值快照的日期的
+ * 现金流按与 TWR 相同的规则归入包含它的子区间，不会静默忽略。
  *
  * <p>跨期链接：先求区间 TWR 收益 R_P、R_B，按公共系数
  * k = (R_P - R_B) / Σ_i (rP_i - rB_i) 缩放三项，再将残余（正常情况下仅为
  * 浮点误差）计入交互项，保证三项合计与超额收益严格一致。单期时 k=1，
  * 退化为教科书 BHB。
+ *
+ * <p>缺少行业拆分时的退化行为：只要组合或基准任一侧没有行业数据，
+ * 就退化为总量层面分解——配置效应与交互效应为 0，选择效应等于全部超额收益，
+ * 行业明细为空。恒等式 配置+选择+交互 = 超额收益 在该模式下同样严格成立。
+ * 两侧都有行业数据但行业集合不一致时，以 SECTOR_SET_MISMATCH 拒绝。
  */
 @Component
 public class AttributionCalculator {
@@ -58,6 +64,18 @@ public class AttributionCalculator {
         double portfolioReturn = returnCalculator.timeWeightedReturn(portfolio);
         double benchmarkReturn = returnCalculator.timeWeightedReturn(benchmark);
         double excessReturn = portfolioReturn - benchmarkReturn;
+
+        if (portfolio.sectorValues().isEmpty() || benchmark.sectorValues().isEmpty()) {
+            // 任一侧缺少行业拆分：退化为总量层面分解，恒等式仍然严格成立。
+            return new AttributionResult(
+                    portfolioReturn,
+                    benchmarkReturn,
+                    excessReturn,
+                    0d,
+                    excessReturn,
+                    0d,
+                    List.of());
+        }
 
         int subPeriods = dates.length - 1;
         double[] pSubReturns = totalSubReturns(portfolio);
@@ -182,11 +200,10 @@ public class AttributionCalculator {
     private double[] totalSubReturns(SectorSeries series) {
         LocalDate[] dates = series.dates();
         double[] totals = series.totals();
-        Map<LocalDate, Double> flows = netFlowsByDate(series, null);
+        double[] intervalFlows = ReturnCalculator.subIntervalFlows(dates, series.flows());
         double[] subReturns = new double[dates.length - 1];
         for (int i = 1; i < dates.length; i++) {
-            double flow = flows.getOrDefault(dates[i], 0d);
-            double endBeforeFlow = totals[i] - flow;
+            double endBeforeFlow = totals[i] - intervalFlows[i - 1];
             if (totals[i - 1] == 0d) {
                 if (endBeforeFlow != 0d) {
                     throw new RejectionException(ErrorCode.INVALID_REQUEST,
@@ -206,12 +223,13 @@ public class AttributionCalculator {
     private Map<String, double[][]> sectorSubReturns(SectorSeries series) {
         LocalDate[] dates = series.dates();
         double[] totals = series.totals();
-        Map<LocalDate, Map<String, Double>> sectorFlows = sectorFlowsByDate(series);
+        Map<String, double[]> sectorFlows = sectorIntervalFlows(series);
 
         Map<String, double[][]> result = new HashMap<>();
         for (Map.Entry<String, double[]> entry : series.sectorValues().entrySet()) {
             String sectorId = entry.getKey();
             double[] values = entry.getValue();
+            double[] flows = sectorFlows.getOrDefault(sectorId, new double[dates.length - 1]);
             double[] returns = new double[dates.length - 1];
             double[] weights = new double[dates.length - 1];
             for (int i = 1; i < dates.length; i++) {
@@ -222,10 +240,7 @@ public class AttributionCalculator {
                                     + dates[i - 1]);
                 }
                 weights[i - 1] = values[i - 1] / baseTotal;
-                double flow = sectorFlows
-                        .getOrDefault(dates[i], Map.of())
-                        .getOrDefault(sectorId, 0d);
-                double endBeforeFlow = values[i] - flow;
+                double endBeforeFlow = values[i] - flows[i - 1];
                 if (values[i - 1] == 0d) {
                     if (endBeforeFlow != 0d) {
                         throw new RejectionException(ErrorCode.INVALID_REQUEST,
@@ -242,26 +257,24 @@ public class AttributionCalculator {
         return result;
     }
 
-    private Map<LocalDate, Double> netFlowsByDate(SectorSeries series, String sectorId) {
-        Map<LocalDate, Double> flows = new HashMap<>();
-        for (CashFlowPoint flow : series.flows()) {
-            if (sectorId != null && !sectorId.equals(flow.sectorId())) {
-                continue;
-            }
-            flows.merge(flow.date(), flow.amount(), Double::sum);
-        }
-        return flows;
-    }
-
-    private Map<LocalDate, Map<String, Double>> sectorFlowsByDate(SectorSeries series) {
-        Map<LocalDate, Map<String, Double>> flows = new HashMap<>();
+    /**
+     * 返回 map: sectorId -> 每个估值子区间的现金流净额。
+     * 归并规则与 TWR 一致：现金流归入包含其日期的子区间 (d_(i-1), d_i]。
+     */
+    private Map<String, double[]> sectorIntervalFlows(SectorSeries series) {
+        Map<String, double[]> flows = new HashMap<>();
         for (CashFlowPoint flow : series.flows()) {
             if (flow.sectorId() == null) {
                 throw new RejectionException(ErrorCode.SECTOR_CASH_FLOW_MISSING,
                         "every cash flow must be assigned to a sector for attribution");
             }
-            flows.computeIfAbsent(flow.date(), ignored -> new HashMap<>())
-                    .merge(flow.sectorId(), flow.amount(), Double::sum);
+            int interval = ReturnCalculator.intervalIndex(series.dates(), flow.date());
+            if (interval < 0) {
+                continue;
+            }
+            flows.computeIfAbsent(flow.sectorId(),
+                    ignored -> new double[series.dates().length - 1])[interval]
+                    += flow.amount();
         }
         return flows;
     }

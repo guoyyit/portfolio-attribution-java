@@ -16,6 +16,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:it;DB_CLOSE_DELAY=-1",
@@ -154,6 +155,126 @@ class PortfolioServiceIntegrationTest {
         RejectionException zeroException = assertThrows(RejectionException.class,
                 () -> service.calculateReturn(zero));
         assertEquals(ErrorCode.ZERO_CASH_FLOW, zeroException.getErrorCode());
+    }
+
+    @Test
+    void cashFlowOnDateWithoutSnapshotIsCountedByBothReturnMeasures() {
+        service.recordValuation(valuation("P7", D0, 100));
+        service.recordValuation(valuation("P7", D2, 110));
+        service.recordCashFlow(flow("P7", "mid", D1, 5)); // no snapshot at D1
+
+        ReturnResponse response = service.queryReturn("P7", D0, D2);
+
+        // TWR: flow joins sub-interval (D0, D2]; MWR: weighted by actual date (7/14)
+        // (outputs are rounded to 6 decimal places)
+        assertEquals(0.05, response.timeWeightedReturn(), 1e-9);
+        assertEquals(5d / 102.5d, response.moneyWeightedReturn(), 1e-6);
+    }
+
+    @Test
+    void adhocCalculationCountsFlowOnDateWithoutValuation() {
+        CalculateReturnRequest request = new CalculateReturnRequest(
+                List.of(new CalculateReturnRequest.ValuationPointDto(D0, 100d),
+                        new CalculateReturnRequest.ValuationPointDto(D2, 110d)),
+                List.of(new CalculateReturnRequest.CashFlowPointDto(D1, 5d)));
+
+        ReturnResponse response = service.calculateReturn(request);
+
+        // same boundary rule as persisted queries: both measures count the flow
+        assertEquals(0.05, response.timeWeightedReturn(), 1e-9);
+        assertEquals(5d / 102.5d, response.moneyWeightedReturn(), 1e-6);
+    }
+
+    @Test
+    void twrFromQueryCompoundsAcrossAdjacentSubIntervals() {
+        LocalDate dMid = LocalDate.of(2024, 1, 10); // no snapshot here
+        service.recordValuation(valuation("P8", D0, 100));
+        service.recordValuation(valuation("P8", D1, 108));
+        service.recordValuation(valuation("P8", D2, 120));
+        service.recordCashFlow(flow("P8", "mid", dMid, 6));
+
+        double whole = service.queryReturn("P8", D0, D2).timeWeightedReturn();
+        double first = service.queryReturn("P8", D0, D1).timeWeightedReturn();
+        double second = service.queryReturn("P8", D1, D2).timeWeightedReturn();
+
+        // documented rounding tolerance for compounded rounded outputs is 2e-6
+        assertEquals(whole, (1 + first) * (1 + second) - 1, 2e-6);
+        // and the whole-interval value is the exact compounded sub-interval result
+        assertEquals(1.08 * (1 + 6d / 108d) - 1, whole, 1e-6);
+    }
+
+    @Test
+    void attributionWithoutAnySectorBreakdownSatisfiesIdentity() {
+        service.recordValuation(valuation("P9", D0, 100));
+        service.recordValuation(valuation("P9", D1, 110));
+        service.recordValuation(valuation("P9", D2, 121));
+        service.recordValuation(valuation("B9", D0, 100));
+        service.recordValuation(valuation("B9", D1, 105));
+        service.recordValuation(valuation("B9", D2, 108));
+
+        AttributionResponse response = service.queryAttribution("P9", "B9", D0, D2);
+
+        assertEquals(0d, response.allocationEffect(), 1e-9);
+        assertEquals(response.excessReturn(), response.selectionEffect(), 1e-9);
+        assertEquals(0d, response.interactionEffect(), 1e-9);
+        assertTrue(response.sectors().isEmpty());
+        // identity on rounded outputs within the documented 2e-6 tolerance
+        assertEquals(response.excessReturn(),
+                response.allocationEffect() + response.selectionEffect()
+                        + response.interactionEffect(), 2e-6);
+        // excess is non-zero: TWR_P = 0.21, TWR_B = 0.08
+        assertEquals(0.13, response.excessReturn(), 1e-9);
+    }
+
+    @Test
+    void attributionWithOneSidedSectorBreakdownDegradesAndKeepsIdentity() {
+        service.recordValuation(new ValuationRequest("P10", D0, 100d, List.of(
+                new ValuationRequest.SectorValueDto("A", 60d),
+                new ValuationRequest.SectorValueDto("B", 40d))));
+        service.recordValuation(new ValuationRequest("P10", D1, 110d, List.of(
+                new ValuationRequest.SectorValueDto("A", 69d),
+                new ValuationRequest.SectorValueDto("B", 41d))));
+        service.recordValuation(valuation("B10", D0, 100));
+        service.recordValuation(valuation("B10", D1, 105));
+
+        AttributionResponse response = service.queryAttribution("P10", "B10", D0, D1);
+
+        assertEquals(0.10, response.portfolioReturn(), 1e-9);
+        assertEquals(0.05, response.benchmarkReturn(), 1e-9);
+        assertEquals(0.05, response.excessReturn(), 1e-9);
+        assertEquals(0d, response.allocationEffect(), 1e-9);
+        assertEquals(response.excessReturn(), response.selectionEffect(), 1e-9);
+        assertEquals(0d, response.interactionEffect(), 1e-9);
+        assertTrue(response.sectors().isEmpty());
+        assertEquals(response.excessReturn(),
+                response.allocationEffect() + response.selectionEffect()
+                        + response.interactionEffect(), 2e-6);
+    }
+
+    @Test
+    void correctingValuationAffectsOnlyIntervalsThatUseIt() {
+        LocalDate d3 = LocalDate.of(2024, 1, 22);
+        service.recordValuation(valuation("P11", D0, 100));
+        service.recordValuation(valuation("P11", D1, 110));
+        service.recordValuation(valuation("P11", D2, 121));
+        service.recordValuation(valuation("P11", d3, 133.1));
+
+        assertEquals(0.10, service.queryReturn("P11", D2, d3).timeWeightedReturn(), 1e-9);
+        double before = service.queryReturn("P11", D0, D2).timeWeightedReturn();
+        assertEquals(0.21, before, 1e-9);
+
+        // correct the D1 snapshot: intervals containing D1 change, others do not
+        service.recordValuation(valuation("P11", D1, 108));
+
+        assertEquals(0.10, service.queryReturn("P11", D2, d3).timeWeightedReturn(), 1e-9);
+        double after = service.queryReturn("P11", D0, D2).timeWeightedReturn();
+        assertEquals(1.08 * (121d / 108d) - 1, after, 1e-9);
+
+        // the corrected interval still compounds exactly from its adjacent parts
+        double whole = service.queryReturn("P11", D0, d3).timeWeightedReturn();
+        double first = service.queryReturn("P11", D0, D1).timeWeightedReturn();
+        double second = service.queryReturn("P11", D1, d3).timeWeightedReturn();
+        assertEquals(whole, (1 + first) * (1 + second) - 1, 2e-6);
     }
 
     private void recordBenchmark() {

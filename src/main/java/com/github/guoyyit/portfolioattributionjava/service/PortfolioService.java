@@ -20,7 +20,8 @@ import com.github.guoyyit.portfolioattributionjava.web.dto.CashFlowRequest;
 import com.github.guoyyit.portfolioattributionjava.web.dto.ReturnResponse;
 import com.github.guoyyit.portfolioattributionjava.web.dto.ValuationRequest;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -30,7 +31,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 @Service
 public class PortfolioService {
@@ -44,89 +45,128 @@ public class PortfolioService {
     private final ReturnCalculator returnCalculator;
     private final AttributionCalculator attributionCalculator;
 
-    private final ReentrantLock writeLock = new ReentrantLock();
+    private final TransactionTemplate writeTx;
+    private final TransactionTemplate readTx;
+
+    /**
+     * 查询一致性保证：公平读写锁，写锁横跨整个写事务（含提交），
+     * 读锁横跨整个只读查询事务。因此查询期间不会有任何写事务提交，
+     * 任何一次查询看到的一定是某个完整提交点的状态，
+     * 不会读到部分写入或新旧混合的数据。该保证由服务层强制，
+     * 不依赖数据库隔离级别配置。
+     */
+    private final ReentrantReadWriteLock consistencyLock = new ReentrantReadWriteLock(true);
 
     public PortfolioService(ValuationSnapshotRepository snapshotRepository,
                             SectorValuationRepository sectorValuationRepository,
                             CashFlowRepository cashFlowRepository,
                             ReturnCalculator returnCalculator,
-                            AttributionCalculator attributionCalculator) {
+                            AttributionCalculator attributionCalculator,
+                            PlatformTransactionManager transactionManager) {
         this.snapshotRepository = snapshotRepository;
         this.sectorValuationRepository = sectorValuationRepository;
         this.cashFlowRepository = cashFlowRepository;
         this.returnCalculator = returnCalculator;
         this.attributionCalculator = attributionCalculator;
+        this.writeTx = new TransactionTemplate(transactionManager);
+        this.readTx = new TransactionTemplate(transactionManager);
+        this.readTx.setReadOnly(true);
     }
 
-    @Transactional
     public void recordValuation(ValuationRequest request) {
         validateValuation(request);
-        writeLock.lock();
+        consistencyLock.writeLock().lock();
         try {
-            ValuationSnapshot snapshot = snapshotRepository
-                    .findByPortfolioIdAndSnapshotDate(request.portfolioId(), request.date())
-                    .orElseGet(() -> new ValuationSnapshot(
-                            request.portfolioId(), request.date(), request.totalValue()));
-            snapshot.setTotalValue(request.totalValue());
-            snapshotRepository.save(snapshot);
-
-            sectorValuationRepository
-                    .findByPortfolioIdAndSnapshotDateOrderBySectorIdAsc(
-                            request.portfolioId(), request.date())
-                    .forEach(sectorValuationRepository::delete);
-            sectorValuationRepository.flush();
-            for (ValuationRequest.SectorValueDto sector : request.sectors()) {
-                sectorValuationRepository.save(new SectorValuation(
-                        request.portfolioId(), request.date(),
-                        sector.sectorId(), sector.marketValue()));
-            }
-            snapshotRepository.flush();
-            sectorValuationRepository.flush();
+            writeTx.executeWithoutResult(status -> doRecordValuation(request));
         } finally {
-            writeLock.unlock();
+            consistencyLock.writeLock().unlock();
         }
     }
 
-    @Transactional
+    private void doRecordValuation(ValuationRequest request) {
+        ValuationSnapshot snapshot = snapshotRepository
+                .findByPortfolioIdAndSnapshotDate(request.portfolioId(), request.date())
+                .orElseGet(() -> new ValuationSnapshot(
+                        request.portfolioId(), request.date(), request.totalValue()));
+        snapshot.setTotalValue(request.totalValue());
+        snapshotRepository.save(snapshot);
+
+        sectorValuationRepository
+                .findByPortfolioIdAndSnapshotDateOrderBySectorIdAsc(
+                        request.portfolioId(), request.date())
+                .forEach(sectorValuationRepository::delete);
+        sectorValuationRepository.flush();
+        for (ValuationRequest.SectorValueDto sector : request.sectors()) {
+            sectorValuationRepository.save(new SectorValuation(
+                    request.portfolioId(), request.date(),
+                    sector.sectorId(), sector.marketValue()));
+        }
+        snapshotRepository.flush();
+        sectorValuationRepository.flush();
+    }
+
     public void recordCashFlow(CashFlowRequest request) {
         validateCashFlow(request);
-        writeLock.lock();
+        consistencyLock.writeLock().lock();
         try {
-            CashFlow flow = cashFlowRepository
-                    .findByPortfolioIdAndExternalFlowId(
-                            request.portfolioId(), request.externalFlowId())
-                    .orElseGet(() -> new CashFlow(
-                            request.portfolioId(), request.externalFlowId(),
-                            request.date(), request.amount(), request.sectorId()));
-            flow.setAmount(request.amount());
-            flow.setFlowDate(request.date());
-            flow.setSectorId(request.sectorId());
-            cashFlowRepository.save(flow);
-            cashFlowRepository.flush();
+            writeTx.executeWithoutResult(status -> doRecordCashFlow(request));
         } finally {
-            writeLock.unlock();
+            consistencyLock.writeLock().unlock();
         }
     }
 
-    @Transactional(readOnly = true)
-    public ReturnResponse queryReturn(String portfolioId, LocalDate start, LocalDate end) {
-        validateRange(portfolioId, start, end);
-        SectorSeries series = loadSeries(portfolioId, start, end);
-        double twr = returnCalculator.timeWeightedReturn(series);
-        double mwr = returnCalculator.moneyWeightedReturn(series);
-        return new ReturnResponse(
-                portfolioId, start.toString(), end.toString(), round6(twr), round6(mwr));
+    private void doRecordCashFlow(CashFlowRequest request) {
+        CashFlow flow = cashFlowRepository
+                .findByPortfolioIdAndExternalFlowId(
+                        request.portfolioId(), request.externalFlowId())
+                .orElseGet(() -> new CashFlow(
+                        request.portfolioId(), request.externalFlowId(),
+                        request.date(), request.amount(), request.sectorId()));
+        flow.setAmount(request.amount());
+        flow.setFlowDate(request.date());
+        flow.setSectorId(request.sectorId());
+        cashFlowRepository.save(flow);
+        cashFlowRepository.flush();
     }
 
-    @Transactional(readOnly = true)
+    public ReturnResponse queryReturn(String portfolioId, LocalDate start, LocalDate end) {
+        validateRange(portfolioId, start, end);
+        consistencyLock.readLock().lock();
+        try {
+            return readTx.execute(status -> {
+                SectorSeries series = loadSeries(portfolioId, start, end);
+                double twr = returnCalculator.timeWeightedReturn(series);
+                double mwr = returnCalculator.moneyWeightedReturn(series);
+                return new ReturnResponse(
+                        portfolioId, start.toString(), end.toString(),
+                        round6(twr), round6(mwr));
+            });
+        } finally {
+            consistencyLock.readLock().unlock();
+        }
+    }
+
     public AttributionResponse queryAttribution(String portfolioId, String benchmarkId,
                                                 LocalDate start, LocalDate end) {
         validateRange(portfolioId, start, end);
         requireText(benchmarkId, "benchmarkId");
-        SectorSeries portfolio = loadSeries(portfolioId, start, end);
-        SectorSeries benchmark = loadSeries(benchmarkId, start, end);
-        AttributionResult result = attributionCalculator.attribute(portfolio, benchmark);
+        consistencyLock.readLock().lock();
+        try {
+            return readTx.execute(status -> {
+                SectorSeries portfolio = loadSeries(portfolioId, start, end);
+                SectorSeries benchmark = loadSeries(benchmarkId, start, end);
+                AttributionResult result =
+                        attributionCalculator.attribute(portfolio, benchmark);
+                return toAttributionResponse(portfolioId, benchmarkId, start, end, result);
+            });
+        } finally {
+            consistencyLock.readLock().unlock();
+        }
+    }
 
+    private AttributionResponse toAttributionResponse(String portfolioId, String benchmarkId,
+                                                      LocalDate start, LocalDate end,
+                                                      AttributionResult result) {
         List<AttributionResponse.SectorAttributionDto> sectorDtos = new ArrayList<>();
         for (SectorAttribution sector : result.sectors()) {
             sectorDtos.add(new AttributionResponse.SectorAttributionDto(

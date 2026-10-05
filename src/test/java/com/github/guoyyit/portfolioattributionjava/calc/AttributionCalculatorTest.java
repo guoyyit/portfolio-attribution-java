@@ -1,5 +1,7 @@
 package com.github.guoyyit.portfolioattributionjava.calc;
 
+import com.github.guoyyit.portfolioattributionjava.error.ErrorCode;
+import com.github.guoyyit.portfolioattributionjava.error.RejectionException;
 import org.junit.jupiter.api.Test;
 
 import java.time.LocalDate;
@@ -7,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class AttributionCalculatorTest {
 
@@ -99,6 +102,94 @@ class AttributionCalculatorTest {
         double sum = result.allocationEffect() + result.selectionEffect()
                 + result.interactionEffect();
         assertEquals(result.excessReturn(), sum, 1e-10);
+    }
+
+    @Test
+    void noSectorBreakdownOnEitherSideStillSatisfiesIdentity() {
+        SectorSeries portfolio = series3(
+                new double[]{100, 110, 121}, Map.of(), List.of());
+        SectorSeries benchmark = series3(
+                new double[]{100, 105, 108}, Map.of(), List.of());
+
+        AttributionResult result = calculator.attribute(portfolio, benchmark);
+
+        assertEquals(0d, result.allocationEffect(), EPS);
+        assertEquals(result.excessReturn(), result.selectionEffect(), EPS);
+        assertEquals(0d, result.interactionEffect(), EPS);
+        assertEquals(0d, result.excessReturn()
+                - (result.allocationEffect() + result.selectionEffect()
+                + result.interactionEffect()), EPS);
+        assertEquals(0, result.sectors().size());
+        // sanity: excess is non-zero, so the identity is not vacuous
+        assertEquals(1.1 * 1.1 - 1.05 * (108 / 105d), result.excessReturn(), EPS);
+    }
+
+    @Test
+    void oneSidedSectorBreakdownDegradesToTotalLevelWithIdentity() {
+        SectorSeries portfolio = series3(
+                new double[]{100, 110, 131},
+                Map.of("A", new double[]{60, 66, 86},
+                       "B", new double[]{40, 44, 45}),
+                List.of(new CashFlowPoint(LocalDate.of(2024, 1, 20), 10, "A")));
+        SectorSeries benchmark = series3(
+                new double[]{100, 108, 120}, Map.of(), List.of());
+
+        AttributionResult result = calculator.attribute(portfolio, benchmark);
+
+        assertEquals(0d, result.allocationEffect(), EPS);
+        assertEquals(result.excessReturn(), result.selectionEffect(), EPS);
+        assertEquals(0d, result.interactionEffect(), EPS);
+        assertEquals(0, result.sectors().size());
+        // TWR_P = 1.1 * (1 + (131-110-10)/110) - 1 = 0.21; TWR_B = 1.08*(120/108)-1 = 0.2
+        assertEquals(0.01, result.excessReturn(), 1e-12);
+    }
+
+    @Test
+    void mismatchedNonEmptySectorSetsAreRejectedStably() {
+        SectorSeries portfolio = series3(
+                new double[]{100, 110, 121},
+                Map.of("A", new double[]{60, 66, 72.6},
+                       "B", new double[]{40, 44, 48.4}),
+                List.of());
+        SectorSeries benchmark = series3(
+                new double[]{100, 105, 108},
+                Map.of("A", new double[]{50, 52.5, 54},
+                       "C", new double[]{50, 52.5, 54}),
+                List.of());
+
+        RejectionException ex = assertThrows(RejectionException.class,
+                () -> calculator.attribute(portfolio, benchmark));
+        assertEquals(ErrorCode.SECTOR_SET_MISMATCH, ex.getErrorCode());
+    }
+
+    @Test
+    void cashFlowOnDateWithoutSnapshotKeepsAttributionIdentity() {
+        LocalDate dMid = LocalDate.of(2024, 1, 20); // no valuation snapshot here
+        SectorSeries portfolio = series3(
+                new double[]{100, 110, 131},
+                Map.of("A", new double[]{60, 66, 86},
+                       "B", new double[]{40, 44, 45}),
+                List.of(new CashFlowPoint(dMid, 10, "A")));
+        SectorSeries benchmark = series3(
+                new double[]{100, 108, 120},
+                Map.of("A", new double[]{50, 54, 66},
+                       "B", new double[]{50, 54, 54}),
+                List.of());
+
+        AttributionResult result = calculator.attribute(portfolio, benchmark);
+
+        // TWR_P = 0.21, TWR_B = 0.2 -> excess 0.01 must be fully explained
+        assertEquals(0.01, result.excessReturn(), 1e-12);
+        double sum = result.allocationEffect() + result.selectionEffect()
+                + result.interactionEffect();
+        assertEquals(result.excessReturn(), sum, 1e-10);
+        // sector rows add up to the totals as well
+        double sectorSum = 0d;
+        for (SectorAttribution sector : result.sectors()) {
+            sectorSum += sector.allocationEffect() + sector.selectionEffect()
+                    + sector.interactionEffect();
+        }
+        assertEquals(result.excessReturn(), sectorSum, 1e-10);
     }
 
     private SectorSeries series(double[] totals,
